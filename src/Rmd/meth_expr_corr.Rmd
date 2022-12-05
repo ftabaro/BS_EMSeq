@@ -1,0 +1,160 @@
+---
+title: "Lsh-/- B cells EMSeq analysis - correlation of methylation dynamics with gene expression change"
+date: "December 3rd, 2020"
+author: 
+- name: Sara Formichetti
+  affiliation: EMBL Rome
+  email: sara.formichetti@embl.it
+output:
+  prettydoc::html_pretty:
+    toc: true # table of content true
+    toc_depth: 3  # upto three depths of headings (specified by #, ## and ###)
+    number_sections: true  ## if you want number sections at each table header
+    fig_caption: yes
+---
+
+```{r, eval=FALSE, include=FALSE}
+
+library(prettydoc)
+
+```
+
+```{r Setting general options, setup, include=FALSE}
+
+knitr::opts_chunk$set(autodep = TRUE, cache = TRUE, echo = FALSE, warning = FALSE, message = FALSE, results = 'hide')
+
+```
+
+```{r loading needed packages, setup}
+
+library(ggplot2)
+library(reshape2)
+library(data.table)
+library(purrr)
+library(ggpubr)
+library(gridExtra)
+library(biomaRt)
+library(ggrepel)
+
+```
+
+```{r Setting seed, setup}
+
+set.seed(2020)
+
+```
+
+# Reading expression data for genes and methylation data for corresponding promoters
+
+I load:
+
+* The result of the DESeq2 analysis performed by Clara to find Differentially Expressed genes at D0, D7 and D14.
+* The loss of % of methylation at the same three time points, coming from 'analysis.Rmd'.
+
+```{r loading expr data sent by Clara, setup}
+
+D0_expr_dt <- fread("../../data/Clara_DESeq_results/res_DEseq2.0_(Naives_KO)_vs_(Naives_Ctrl).csv", drop = c(2, 6, 7:10, 12:15, 18:21))
+names(D0_expr_dt) <- c("ensembl_gene_id", "gene_symbol", "pval_D0", "adjpval_D0", "mean_KO_D0", "mean_WT_D0", "meanRatio_D0")
+D7_expr_dt <- fread("../../data/Clara_DESeq_results/res_DEseq2.0_(J7_KO)_vs_(J7_Ctrl).csv", drop = c(2, 6, 7:10, 12:15, 18:21))
+names(D7_expr_dt) <- c("ensembl_gene_id", "gene_symbol", "pval_D7", "adjpval_D7", "mean_KO_D7", "mean_WT_D7", "meanRatio_D7")
+D14_expr_dt <- fread("../../data/Clara_DESeq_results/res_DEseq2.0_(J14_KO)_vs_(J14_Ctrl).csv", drop = c(2, 6, 7:10, 12:15, 18:21))
+names(D14_expr_dt) <- c("ensembl_gene_id", "gene_symbol", "pval_D14", "adjpval_D14", "mean_KO_D14", "mean_WT_D14", "meanRatio_D14")
+expr_dt <- Reduce(function(...) merge(..., by = c("ensembl_gene_id", "gene_symbol")), list(D0_expr_dt, D7_expr_dt, D14_expr_dt))
+rm(D0_expr_dt, D7_expr_dt, D14_expr_dt)
+
+```
+
+```{r loading meth data for promoters, setup}
+
+load("prom_meth_dt.Rdata")
+# making time points names compatible with the dt of expr changes
+names(prom_meth_dt) <- gsub("_1", "_D0", names(prom_meth_dt))
+names(prom_meth_dt) <- gsub("_2", "_D7", names(prom_meth_dt))
+names(prom_meth_dt) <- gsub("_3", "_D14", names(prom_meth_dt))
+
+```
+
+```{r expr-meth dt, setup}
+
+# computing baseMean of expression in KO e WT samples
+expr_dt$baseMean_KO <- expr_dt[, rowMeans(.SD), .SDcols = grep("mean_KO", names(expr_dt), value = TRUE)]
+expr_dt$baseMean_WT <- expr_dt[, rowMeans(.SD), .SDcols = grep("mean_WT", names(expr_dt), value = TRUE)]
+
+# making expr dt and meth dt long for plotting
+expr_dt_long <- melt(expr_dt, measure.vars = grep("meanRatio", names(expr_dt)), value.name = "meanRatio")
+expr_dt_long$time_point <- gsub("meanRatio_", "", expr_dt_long$variable)
+prom_meth_dt_long <- melt(prom_meth_dt, measure.vars = grep("meth.diff", names(prom_meth_dt)), value.name = "meth.diff")
+prom_meth_dt_long$time_point <- gsub("meth.diff_", "", prom_meth_dt_long$variable)
+
+# merging expr and methylation dt by time point
+expr_meth_dt_long <- merge(prom_meth_dt_long[, .(ensembl_gene_id, meth.diff, cluster, time_point)], expr_dt_long[, .(ensembl_gene_id, meanRatio, time_point, gene_symbol, adjpval_D0, adjpval_D7, adjpval_D14, baseMean_WT, baseMean_KO)], by = c("ensembl_gene_id", "time_point"))
+
+# removing genes with meanRatio == 0 or meanRatio == 1 or meanRatio == NAs
+expr_meth_dt_long <- expr_meth_dt_long[!(is.na(meanRatio)) & meanRatio != 0]
+  
+# computing log2FoldChange from meanRatio
+expr_meth_dt_long$log2FoldChange <- log2(expr_meth_dt_long$meanRatio)
+
+```
+
+```{r saving excel-like file with meth loss and gene expr change info for highly meth prom, setup}
+
+excel_dt <- expr_meth_dt_long[cluster == "D0_loosing"]
+write.table(excel_dt[order(log2FoldChange, decreasing = TRUE)], file = "../../analysis/meth_dynamics/methDiff_vs_log2FC_nonResistant.tsv", col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
+
+```
+
+# Promoters loosing DNA methylation become more susceptible to "noisy" gene expression change
+
+**IMPORTANT NOTE**: for none of the genes labeled in the plot the gene expression change is significant! 
+
+```{r expr-meth correlation scatterplot, setup, fig.height = 7, fig.width = 12, include = TRUE}
+
+# adding gene symbol as label for genes de-silensed because of de-methylation
+expr_meth_dt_long$label <- expr_meth_dt_long$gene_symbol
+expr_meth_dt_long$label[expr_meth_dt_long$log2FoldChange < 0.5 | expr_meth_dt_long$meth.diff <= 0] <- "" 
+
+highly_resistant_gg <- ggplot(data = expr_meth_dt_long[cluster == "highly_resistant"], aes(x = meth.diff, y = log2FoldChange, group = ensembl_gene_id)) +
+  geom_point(aes(color = time_point), size = 3) +
+  geom_text_repel(aes(label = label)) +
+  xlab("\n% DNA methylation loss in Lsh-/-") +
+  ylab("log2FC in Lsh-/-\n") +
+  scale_y_continuous(limits = c(-2.5, 4)) +
+  scale_color_discrete(name = "time point") +
+  ggtitle("Genes whose promoters are\nthe most resistant to demethylation\n(highly resistant cluster)") +
+  theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20), 
+          title = element_text(size = 18),
+          legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+          legend.key.height = unit(1.5,"line"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black"),
+          panel.border = element_rect(colour = "black", fill=NA))
+loosing_gg <- ggplot(data = expr_meth_dt_long[cluster %in% c("less_resistant", "D0_loosing")], aes(x = meth.diff, y = log2FoldChange, group = ensembl_gene_id)) +
+  geom_point(aes(color = time_point), size = 3) +
+  geom_text_repel(aes(label = label)) +
+  xlab("\n% DNA methylation loss in Lsh-/-") +
+  ylab("log2FC in Lsh-/-\n") +
+  scale_color_discrete(name = "time point") +
+  scale_y_continuous(limits = c(-2.5, 4)) +
+  scale_x_continuous(limits = c(-10, 70)) +
+  ggtitle("Genes whose promoters are\nthe less resistant to demethylation\n(DO loosing and less resistant cluster)") +
+  theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20), 
+          title = element_text(size = 18),
+          legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+          legend.key.height = unit(1.5,"line"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black"),
+          panel.border = element_rect(colour = "black", fill=NA))
+ggarrange(highly_resistant_gg, loosing_gg, common.legend = TRUE)
+
+```
+
+```{r sessioninfo, setup, echo = TRUE, results = 'markup'}
+
+sessionInfo()
+
+```

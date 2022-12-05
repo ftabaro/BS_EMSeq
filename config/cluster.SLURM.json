@@ -1,0 +1,37 @@
+{
+  "__default__": {
+    "queue": "htc",
+    "nCPUs": "{threads}",
+    "memory": 10000,
+    "maxTime": "5:00:00",
+    "name": "{rule}.{wildcards}",
+    "rulename": "{rule}",
+    "output": "cluster_logs/{rule}_%j.out",
+    "error" : "cluster_logs/{rule}_%j.err",
+    "group": "boulard"
+  },
+  "align": {
+    "memory": 50000,
+    "maxTime": "30:00:00"
+  },
+  "deduplicate": {
+    "memory": 50000,
+    "maxTime": "30:00:00"
+  }, 
+  "deduplicate": {
+    "memory": 50000,
+    "maxTime": "30:00:00"
+  }, 
+  "count_in_tiles": {
+    "memory": 50000
+  },
+  "count_on_promoters": {
+    "memory": 50000
+  },
+  "count_on_nonPromoter_CGI": {
+    "memory": 40000
+  },
+  "count_on_nonPromoter_CGI": {
+    "memory": 50000
+  }
+}

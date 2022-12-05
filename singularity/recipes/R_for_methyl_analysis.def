@@ -1,0 +1,57 @@
+BootStrap: debootstrap
+OSVersion: bionic
+MirrorURL: http://us.archive.ubuntu.com/ubuntu/
+
+%help
+
+	This singularity contains R 3.6.1 and R packages useful for analysis of methylation data, the main one being methylKit.
+
+%post
+    # ~~~~~~ General setup and folder creation ~~~~~~ #
+    
+    apt-get update && apt-get install -y wget bzip2 build-essential \
+    make gcc g++ gfortran libxml2-dev libcairo2-dev unzip libcpan-meta-perl \
+    libgd-dev libkrb5-3 gzip libxtst6 libx11-dev libxext-dev libxfixes-dev \
+    libxi6 libxi-dev libxmu-dev
+    
+    export LC_ALL=C
+    export LC_CTYPE=C 
+    export LC_COLLATE=C 
+    export LC_TIME=C
+    export LC_MESSAGES=C
+    export LC_MONETARY=C
+    export LC_PAPER=C 
+    export LC_MEASUREMENT=C
+	
+    # ~~~~~ MINICONDA ~~~~~ #
+    wget https://repo.continuum.io/miniconda/Miniconda3-latest-Linux-x86_64.sh && \
+    bash Miniconda3-latest-Linux-x86_64.sh -b -p /conda && \
+    rm -f Miniconda3-latest-Linux-x86_64.sh
+    export PATH="/conda/bin:${PATH}"
+    
+      # ~~~~~ R 3.6.1 ~~~~~ #
+      conda install -y -c r r-base=3.6.1
+      conda install -c r r-xml
+	
+	# ~~~~~ Install required R packages ~~~~~ #
+        conda install -y -c r r-ggplot2
+        R --slave -e 'install.packages("BiocManager", repos="https://cloud.r-project.org/")'
+  	R --slave -e 'BiocManager::install("methylKit")'
+        R --slave -e 'BiocManager::install("Biostrings")'
+	
+%environment
+    export PATH="${PATH}:/conda/bin"
+    export PATH="${PATH}:/opt"
+    export PATH="${PATH}:/opt/sratoolkit.2.10.4-ubuntu64/bin"
+    export LC_ALL=C
+    export LC_CTYPE=C 
+    export LC_COLLATE=C 
+    export LC_TIME=C
+    export LC_MESSAGES=C
+    export LC_MONETARY=C
+    export LC_PAPER=C 
+    export LC_MEASUREMENT=C
+
+%labels
+	Author Nicolas Descostes and Sara Formichetti (sara.formichetti@embl.it)
+	Version v0.0.2

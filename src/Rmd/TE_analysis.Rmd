@@ -1,0 +1,319 @@
+---
+title: "Lsh-/- B cells EMSeq analysis - methylation of Transposable Elements"
+date: "November 17, 2020"
+author: 
+- name: Sara Formichetti
+  affiliation: EMBL Rome
+  email: sara.formichetti@embl.it
+output:
+  prettydoc::html_pretty:
+    toc: true # table of content true
+    toc_depth: 3  # upto three depths of headings (specified by #, ## and ###)
+    number_sections: true  ## if you want number sections at each table header
+    fig_caption: yes
+---
+
+```{r, eval=FALSE, include=FALSE}
+
+library(prettydoc)
+
+```
+
+```{r Setting general options, setup, include=FALSE}
+
+knitr::opts_chunk$set(autodep = TRUE, cache = TRUE, echo = FALSE, warning = FALSE, message = FALSE, results = 'hide')
+
+```
+
+```{r loading needed packages, setup}
+
+library(ggplot2)
+library(reshape2)
+library(data.table)
+library(methylKit)
+library(rtracklayer)
+library(GenomicRanges)
+library(purrr)
+library(ggpubr)
+library(genomation)
+library(pheatmap)
+
+```
+
+```{r dist functions, setup, include = TRUE}
+
+# Defining distance functions necessary for clustering and heatmap
+distfun <- function(m) as.dist(1 - (cor(t(m+0.000000001), method="spearman")))
+distfun_col <- function(m) as.dist(1 - (cor(m+0.000000001, method="spearman")))
+
+```
+
+# Reading and quantifying the data
+
+I load:
+
+* the methylRawList objects (objects of package methylKit) produced by R script ../R/TE_counts.R.R, run in a rule of the Snakefile on the cluster
+* the table containing samples' information
+
+```{r load quantification over TEs, setup}
+
+load("../R/mrl_TE.Rdata")
+
+```
+
+```{r samples table, setup, results = 'asis'}
+
+# loading samples table
+samples_table <- fread("../../data/sequencing/samples_table.csv")
+# adding samples' short names
+samples_table$sample_name <- gsub(".*EMSeq_", "", samples_table$sample)
+# sort the table by sample short names
+setkey(samples_table, sample_name)
+
+```
+
+# Percentage of methylation of Transposable Elements and other repeats
+
+```{r unify samples, setup}
+
+# merging samples into a single table for comparison analysis
+meth_TE_dt <- methylKit::unite(mrl_TE)
+
+```
+
+```{r relevel methylBase chr factor, setup}
+
+# need to add "chr" to chr factor levels in all methylBase obj to make them compatible with annotation granges obj
+relevel_chr_factor <- function (methyl_obj) {
+  levels(methyl_obj[[1]]) <- paste0("chr", levels(methyl_obj[[1]]))
+  return(methyl_obj)
+}
+meth_TE_dt <- relevel_chr_factor(meth_TE_dt)
+
+# need to convert methylBase object into GRanges
+meth_TE_gr <- as(meth_TE_dt, "GRanges")
+
+```
+
+```{r pooling biol repl, setup}
+
+## Function which produces data.table of mean methylation percentage between biological replicates for each region of input GRanges obj
+pool_biol_rep <- function (my_gr_obj, my_mb_obj, my_samples_table) {
+  # Function which computes methylation percentage for each sample
+  make_perc_table <- function (gr_obj, mb_obj, sample_nr) {
+    perc_dt <- data.table(seqnames = as.character(seqnames(gr_obj)), start = start(gr_obj), end = end(gr_obj), width = width(gr_obj), meth_perc = 100*mcols(gr_obj)[, paste0("numCs", sample_nr)]/mcols(gr_obj)[, paste0("coverage", sample_nr)], sample_name = rep(mb_obj@sample.ids[sample_nr], times = nrow(mcols(gr_obj))))
+  return(perc_dt)
+  }
+  # Applying the function to all samples and merging all samples in same dt
+  perc_dt_all <- do.call("rbind", lapply(X = 1:length(my_mb_obj@sample.ids), FUN = make_perc_table, gr_obj = my_gr_obj, mb_obj = my_mb_obj))
+  setkey(perc_dt_all, sample_name)
+  # Computing average of meth perc for biol repl (i.e. samples sharing condition and time point)
+  setkey(my_samples_table, sample_name)
+  perc_dt_all <- merge(perc_dt_all, my_samples_table[, .(sample_name, group_or_time_point, condition)], by = "sample_name")
+  return(perc_dt_all[, .(meth_perc = mean(meth_perc)), by = .(seqnames, start, end, group_or_time_point, condition)])
+}
+
+meth_TE_pooled_dt <- pool_biol_rep(my_gr_obj = meth_TE_gr, my_mb_obj = meth_TE_dt, my_samples_table = samples_table)
+
+```
+
+```{r reading annotation, setup}
+
+TE_annotation_bed <- "../../data/annotations/RepeatMasker_RepeatLibrary20140131_mm10.noGenes.noSimple.bed"
+TE_anno <- fread(TE_annotation_bed, fill = TRUE, col.names = c("seqnames", "start", "end", "repName", "strand", "repFamClass"), drop = 5)
+# adding +1 to start is necessary for compatibility with methylBase-derived objects because bed file coordinates are 0-based
+TE_anno$start <- TE_anno$start + 1
+# making column with repFamilies only and column with repClasses only
+TE_anno$repFamily <- gsub(".*/", "", TE_anno$repFamClass)
+TE_anno$repClass <- gsub("/.*", "", TE_anno$repFamClass)
+
+# merging the count table with TE annotation to get repFamilies and Classes
+meth_TE_pooled_dt <- merge(meth_TE_pooled_dt, TE_anno[, c("seqnames", "start", "end", "repName","repFamClass", "repFamily", "repClass"), with = FALSE], by = c("seqnames", "start", "end"), all.x = TRUE, all.y = FALSE)
+
+```
+
+```{r saving meth dt to Rdata file, setup}
+
+save(meth_TE_pooled_dt, file = "../R/meth_TE_pooled_dt.Rdata")
+
+```
+
+Below, the Repetitive Elements on which I counted methylation:
+
+```{r TE anno table, setup, results = 'asis'}
+
+library(knitr)
+kable(setkey(TE_anno[, .N, by = c("repFamily", "repClass"),], repFamily), caption = "All repFamilies and Classes in my filtered rmsk annotation")
+kable(setorderv(TE_anno[grep("L1$|ERV1$|ERVK$|ERVL$|B2$|Alu$", TE_anno$repFamily), .N, by = c("repName", "repFamily", "repClass"),], cols=c("repFamily", "N"), order = -1L), caption = "All active RNA transposons in my filtered rmsk annotation")
+
+```
+
+For each genotype and time point, the average of the two different biological replicates is shown.
+
+```{r methyl violins by repFamily, setup, include = TRUE, fig.height=13, fig.width=18}
+
+meth_violin_by_repFamily <- function (my_pooled_meth_dt, my_title) {
+  my_pooled_meth_dt$condition <- factor(my_pooled_meth_dt$condition, levels = c("WT", "KO"))
+  ggviolin(my_pooled_meth_dt,
+           x = "group_or_time_point", y = "meth_perc", 
+           fill = "condition",
+           ylab = "% CpG methylation\n",
+           xlab = "\nsample",
+           facet.by = "repFamily", panel.labs.font = list(size = 18)) +
+    scale_x_discrete(labels = c("D0", "D7", "D14")) +
+    scale_y_continuous(limits = c(0,100)) +
+    scale_fill_discrete(name= "genotype") +
+    ggtitle(my_title) +
+    theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20), 
+          axis.text.x = element_text(angle = 45, hjust = 1), 
+          title = element_text(size = 22),
+          legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+          legend.key.height = unit(1.5,"line"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black"),
+          panel.border = element_rect(colour = "black", fill=NA))
+}
+
+meth_violin_by_repFamily(meth_TE_pooled_dt[grep("L1$|L2$|ERV1$|ERVK$|ERVL$", meth_TE_pooled_dt$repFamily)], my_title = "Main Families of autonomous RNA transposons (all active except for L2)")
+meth_violin_by_repFamily(meth_TE_pooled_dt[grep("B2$|B4$|Alu$|ERVL-MaLR", meth_TE_pooled_dt$repFamily)], my_title = "Main Families of non-autonomous RNA transposons (all active except for B4)")
+meth_violin_by_repFamily(meth_TE_pooled_dt[!grep("\\?|Unknown|Other|L1$|ERV1$|ERVK$|ERVL$|B2$|Alu$|L2$|B4$|ERVL-MaLR", meth_TE_pooled_dt$repFamily)], my_title = "Satellites and other DNA repeats")
+
+```
+
+```{r methyl violins by repClass, setup, include = TRUE, fig.height=13, fig.width=18}
+
+meth_violin_by_repClass <- function (my_pooled_meth_dt, my_title) {
+  my_pooled_meth_dt$condition <- factor(my_pooled_meth_dt$condition, levels = c("WT", "KO"))
+  ggviolin(my_pooled_meth_dt,
+           x = "group_or_time_point", y = "meth_perc", 
+           fill = "condition",
+           ylab = "% CpG methylation\n",
+           xlab = "\nsample",
+           facet.by = "repClass", panel.labs.font = list(size = 18)) +
+    scale_x_discrete(labels = c("D0", "D7", "D14")) +
+    scale_y_continuous(limits = c(0,100)) +
+    scale_fill_discrete(name= "genotype") +
+    ggtitle(my_title) +
+    theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20), 
+          axis.text.x = element_text(angle = 45, hjust = 1), 
+          title = element_text(size = 22),
+          legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+          legend.key.height = unit(1.5,"line"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black"),
+          panel.border = element_rect(colour = "black", fill=NA))
+}
+
+meth_violin_by_repClass(meth_TE_pooled_dt[grep("L1$|L2$|ERV1$|ERVK$|ERVL$|B2$|B4$|Alu$|ERVL-MaLR|Satellite", meth_TE_pooled_dt$repFamily)], my_title = "Main classes of RNA transposons and Satellite repeats")
+
+```
+
+# Closer look at RNA transposons
+
+```{r computing loss of methylation, setup}
+
+## Function to make wide table containing comparisons for averaged methylation percentages of repNames between WT samples from time 0 to 3 and between WT and KO samples at the different time points
+make_wide <- function (meth_table) {
+  # making wide dt having wt and ko meth perc for different time points on same row
+  meth_table_wide <- dcast(meth_table, seqnames + start + end + repName + repFamily + repClass ~ condition + group_or_time_point, fun.aggregate = NULL, value.var = "meth_perc")
+  # computing wt-ko meth difference for each element at each time point
+  meth_table_wide$meth.diff_1 <- meth_table_wide$WT_1 - meth_table_wide$KO_1
+  meth_table_wide$meth.diff_2 <- meth_table_wide$WT_2 - meth_table_wide$KO_2  
+  meth_table_wide$meth.diff_3 <- meth_table_wide$WT_3 - meth_table_wide$KO_3
+  meth_table_wide$meth.diff_WT <- meth_table_wide$WT_3 - meth_table_wide$WT_1
+  # for L1, each element will be averaged for all the subelements (I, II, III ecc)
+  meth_table_wide$repName[grep("L1", meth_table_wide$repName)] <- gsub("_.*", "", meth_table_wide$repName[grep("L1", meth_table_wide$repName)])
+  # averaging meth.diff by repName
+  return(meth_table_wide[, lapply(.SD, mean), by = .(repName, repFamily, repClass), .SDcols = grep("WT|KO|meth.diff", names(meth_table_wide), value = TRUE)])
+}
+
+meth_TE_pooled_byrepName <- make_wide(meth_TE_pooled_dt)
+
+```
+
+```{r heatmap, setup, include = TRUE, fig.height=5, fig.width=8}
+
+## Function to make a heatmap with a subset of repeat elements
+TE_hm <- function (wide_table, my_favourite_class, my_favourite_repeats) {
+  if (my_favourite_repeats != "none") {
+    # selecting only favourite repeats
+    wide_table <- wide_table[repName %in% my_favourite_repeats]
+  }
+  # making df with only the numeric values
+  pheat_df <- as.data.frame(wide_table)[, grep("meth.diff", names(wide_table))]
+  # rownames appearing on heatmap will be the repNames
+  rownames(pheat_df) <- wide_table$repName
+  # plotting heatmap
+  pheatmap(pheat_df, cluster_rows = FALSE, cluster_cols = FALSE, show_rownames = TRUE, clustering_distance_rows = distfun(pheat_df), fontsize = 20, main = my_favourite_class)
+}
+
+TE_hm(meth_TE_pooled_byrepName, my_favourite_class = "LINE/SINE", my_favourite_repeats = c("L1MdA", "L1MdF", "L1MdT", "Lx2B2", "Lx3C", "B1_Mm", "B2_Mm1a"))
+TE_hm(meth_TE_pooled_byrepName, my_favourite_class = "ERVK", my_favourite_repeats = c("MMERVK10C-int", "IAPEz-int", "IAP-d-int", "IAPEY4_I-int", "IAPEy-int", "ETnERV3-int", "RLTR10-int", "MMERVK10D3_I-int", "MMERVK9E_I-int"))
+TE_hm(meth_TE_pooled_byrepName, my_favourite_class = "ERV1", my_favourite_repeats = c("RLTR30D_MM", "MMVL30-int", "MMERGLN-int", "MMERGLN_LTR", "MURVY-int"))
+TE_hm(meth_TE_pooled_byrepName, my_favourite_class = "ERVL", my_favourite_repeats = c("ORR1A0-int", "MERVL-int", "ORR1A1-int", "MERVL_2A-int"))
+
+```
+
+```{r scatterplot, setup, include = TRUE, fig.height=8, fig.width=20}
+
+a <- ggplot(data = meth_TE_pooled_byrepName[!grep("\\?|Unknown|Other|RNA|DNA|Satellite", meth_TE_pooled_byrepName$repClass)]) +
+  geom_point(aes(x = WT_1, y = KO_1, color = repFamily)) +
+  scale_x_continuous(limits = c(0,100)) +
+    scale_y_continuous(limits = c(0,100)) +
+    ggtitle("Day 0") +
+    xlab("WT") +
+    ylab("KO") +
+    theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20), 
+          title = element_text(size = 20),
+          legend.text = element_text(size = 18), legend.title = element_text(size = 18),
+          legend.key.height = unit(1.5,"line"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black"),
+          panel.border = element_rect(colour = "black", fill=NA))
+b <- ggplot(data = meth_TE_pooled_byrepName[!grep("\\?|Unknown|Other|RNA|DNA|Satellite", meth_TE_pooled_byrepName$repClass)]) +
+  geom_point(aes(x = WT_2, y = KO_2, color = repFamily)) +
+  scale_x_continuous(limits = c(0,100)) +
+    scale_y_continuous(limits = c(0,100)) +
+    ggtitle("Day 7") +
+    xlab("WT") +
+    ylab("KO") +
+    theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20), 
+          title = element_text(size = 20),
+          legend.text = element_text(size = 18), legend.title = element_text(size = 18),
+          legend.key.height = unit(1.5,"line"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black"),
+          panel.border = element_rect(colour = "black", fill=NA))
+c <- ggplot(data = meth_TE_pooled_byrepName[!grep("\\?|Unknown|Other|RNA|DNA|Satellite", meth_TE_pooled_byrepName$repClass)]) +
+  geom_point(aes(x = WT_3, y = KO_3, color = repFamily)) +
+  scale_x_continuous(limits = c(0,100)) +
+    scale_y_continuous(limits = c(0,100)) +
+    ggtitle("Day 14") +
+    xlab("WT") +
+    ylab("KO") +
+    theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20), 
+          title = element_text(size = 20),
+          legend.text = element_text(size = 18), legend.title = element_text(size = 18),
+          legend.key.height = unit(1.5,"line"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black"),
+          panel.border = element_rect(colour = "black", fill=NA))
+ggarrange(a, b, c, nrow = 1, common.legend = TRUE)
+
+```
+
+```{r sessioninfo, setup, echo = TRUE, results = 'markup'}
+
+sessionInfo()
+
+```

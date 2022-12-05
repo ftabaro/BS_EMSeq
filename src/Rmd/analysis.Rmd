@@ -1,0 +1,1057 @@
+---
+title: "Lsh-/- B cells EMSeq analysis"
+date: "October 20, 2020"
+author: 
+- name: Sara Formichetti
+  affiliation: EMBL Rome
+  email: sara.formichetti@embl.it
+output:
+  prettydoc::html_pretty:
+    toc: true # table of content true
+    toc_depth: 3  # upto three depths of headings (specified by #, ## and ###)
+    number_sections: true  ## if you want number sections at each table header
+    fig_caption: yes
+---
+
+```{r, eval=FALSE, include=FALSE}
+
+library(prettydoc)
+
+```
+
+```{r Setting general options, setup, include=FALSE}
+
+knitr::opts_chunk$set(autodep = TRUE, cache = TRUE, echo = FALSE, warning = FALSE, message = FALSE, results = 'hide')
+
+```
+
+```{r loading needed packages, setup}
+
+library(ggplot2)
+library(reshape2)
+library(data.table)
+library(methylKit)
+library(rtracklayer)
+library(GenomicRanges)
+#library(purrr)
+library(ggpubr)
+library(genomation)
+library(pheatmap)
+library(gridExtra)
+library(biomaRt)
+
+```
+
+```{r Setting seed, setup}
+
+set.seed(2020)
+
+```
+
+```{r dist functions, setup, include = TRUE}
+
+# Defining distance functions necessary for clustering and heatmap
+distfun <- function(m) as.dist(1 - (cor(t(m+1),method="spearman")))
+distfun_col <- function(m) as.dist(1 - (cor(m+1, method="spearman")))
+
+```
+
+# Reading and quantifying the data
+
+I load:
+
+* the methylRawList objects (objects of package methylKit) produced by R scripts ../R/CpG_tiles_counts.R, ../R/promoter_counts.R and ../R/nonPromoter_CGI_counts.R, run in a rule of the Snakefile on the cluster
+* the table containing samples' information
+
+```{r load quantification over tiles and promoters and non-promoter CpG islands, setup}
+
+load("../R/mrl_tiles_200.Rdata")
+load("../R/mrl_tiles_50.Rdata")
+load("../R/mrl_TSS.Rdata")
+load("../R/mrl_nonProm_CGI.Rdata")
+
+```
+
+```{r exporting as bedgraph, setup, eval = FALSE}
+
+# Function to export the methylRawList objects as bedgraph containing meth percentages, for visualization on genome browser
+mrl_to_bedgraph <- function (mrl_obj, num_CpG_in_tiles) {
+  # converting methylRawList object to GRangesList
+  methyl_grl <- as(lapply(mrl_obj, function (mr_obj) {as(mr_obj, "GRanges")}), "GRangesList")
+  # adding "chr" to chr names
+  add_chr_to_chr <- function (gr_obj) {
+    seqlevels(gr_obj) <- paste0("chr", seqlevels(gr_obj))
+    return(gr_obj)
+  }
+  methyl_grl <- lapply(methyl_grl, add_chr_to_chr)
+  # sample names as GRangesList names
+  names(methyl_grl) <- unlist(lapply(mrl_obj, function (mr_obj) {mr_obj@sample.id}))
+  # adding meth percentage to GRanges objects' metadata and removing the other columns
+  add_meth_perc <- function (gr_obj) {
+    gr_obj$meth_perc <- 100*gr_obj$numCs/gr_obj$coverage
+    mcols(gr_obj) <- mcols(gr_obj)[-c(1:3)]
+    return(gr_obj)
+  }
+  methyl_grl <- lapply(methyl_grl, add_meth_perc)
+  # export each GRanges object as BedGraph
+  bg_export <- function (g, grl_obj) {
+    file_name <- paste0("../../analysis/bedGraph/", names(grl_obj)[g], "_tiles_", num_CpG_in_tiles, "_meth_perc.bedGraph")
+    definition_line <- paste0('track type=bedGraph name=', names(grl_obj)[g], ' description="% of methylation" visibility=full autoScale=off maxHeightPixels=60 viewLimits=0:100')
+    bedGraph_df <- data.frame(chrom=seqnames(grl_obj[[g]]),
+                  chromStart=start(grl_obj[[g]])-1,
+                  chromEnd=end(grl_obj[[g]]),
+                  dataValue=grl_obj[[g]]$meth_perc)
+    write.table(definition_line, file_name, quote = FALSE, row.names = FALSE, col.names = FALSE)
+    write.table(bedGraph_df, file_name, quote = FALSE, row.names = FALSE, col.names = FALSE, append = TRUE, sep = "\t")
+  }
+  lapply(1:length(methyl_grl), bg_export, grl_obj = methyl_grl)
+}
+
+# setting global option to avoid writing big numbers (e.g. start and end coordinates) as exponential in the output file
+options(scipen = 190794454)
+# applying function to all GRanges in GRangesList
+mrl_to_bedgraph(mrl_tiles_50, num_CpG_in_tiles = 50)
+mrl_to_bedgraph(mrl_TSS, num_CpG_in_tiles = "900bpprom")
+
+```
+
+```{r samples table, setup, results = 'asis'}
+
+# loading samples table
+samples_table <- fread("../../data/sequencing/samples_table.csv")
+# adding samples' short names
+samples_table$sample_name <- gsub(".*EMSeq_", "", samples_table$sample)
+# sort the table by sample short names
+setkey(samples_table, sample_name)
+
+knitr::kable(samples_table, caption = "Samples table")
+
+```
+
+# Data exploration
+
+## Global methylation statistics for 200 CpG tiles
+
+```{r meth stats plot, setup, include = TRUE, fig.height=24, fig.width=20, eval = FALSE}
+
+my_getMethylationStats <- function(object,labels,...) {
+                      
+  all.met =100* object$numCs/object$coverage
+  
+  if(labels){                          
+    a=hist((all.met),plot=FALSE,...)
+    my.labs=as.character(round(100*a$counts/length(all.met),1))
+    }else{my.labs=FALSE}
+  hist((all.met),col="cornflowerblue",
+        xlab=paste("% methylation per",object@resolution),
+        main="",
+        labels=my.labs,...)
+      mtext(object@sample.id, side = 3, cex = 3)
+
+}
+
+mrl_plotStats <- function (single_mrl) {
+  my_getMethylationStats(single_mrl, labels = TRUE)
+}
+
+par(mfrow = c(length(mrl_tiles_200)/4,4), cex = 2)
+lapply(mrl_tiles_200, mrl_plotStats)
+
+```
+
+```{r average methyl levels dotplot, setup, include = TRUE, fig.height=12, fig.width=15}
+
+global_meth_levels <- function (obj_list) {
+  make_perc_dt <- function (obj) {
+    data.table(meth_perc = 100*obj$numCs/obj$coverage, sample = rep(obj@sample.id, length(obj$coverage)))
+  }
+  perc_dt <- do.call("rbind", lapply(obj_list, make_perc_dt))
+  perc_dt$genotype <- as.character(rep(obj_list@treatment, times = as.integer(table(perc_dt$sample))))
+  perc_dt$genotype <- ifelse(perc_dt$genotype == "0", "WT", "KO")
+  avg_dt <- perc_dt[, .(meth_perc_avg = mean(meth_perc), genotype = unique(genotype)), by = sample]
+  avg_dt$time_point <- gsub("-.*$", "", avg_dt$sample)
+  avg_dt <- avg_dt[, .(meth_perc_avg, group_avg = mean(meth_perc_avg), sample), by = .(genotype, time_point)]
+  # I reorder time points for the plot
+  avg_dt$time_point <- factor(avg_dt$time_point, levels = c("D0", "D7", "D14"))
+  ggplot(data = avg_dt, aes(x = time_point, y = meth_perc_avg, color = genotype)) +
+    geom_point(size = 5) +
+    geom_errorbar(width = 0.4, size = 0.8, aes(ymax=after_stat(y), ymin=after_stat(y), y = group_avg)) +
+    ylab("average % CpG methylation\n") +
+    xlab("") +
+    theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20), 
+          axis.text.x = element_text(angle = 45, hjust = 1), 
+          title = element_text(size = 18),
+          legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+          legend.key.height = unit(1.5,"line"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black"))
+}
+
+
+global_meth_levels(mrl_tiles_200)
+
+```
+
+```{r global methyl violins, setup, include = TRUE, fig.height=12, fig.width=15}
+
+global_meth_violin <- function (obj_list) {
+  make_perc_dt <- function (obj) {
+    data.table(meth_perc = 100*obj$numCs/obj$coverage, sample = rep(obj@sample.id, length(obj$coverage)))
+  }
+  perc_dt <- do.call("rbind", lapply(obj_list, make_perc_dt))
+  perc_dt$genotype <- as.character(rep(obj_list@treatment, times = as.integer(table(perc_dt$sample))))
+  perc_dt$genotype <- ifelse(perc_dt$genotype == "0", "WT", "KO")
+  # I reorder sample just for plot to be nicer
+  perc_dt$sample <- factor(perc_dt$sample, levels = c("D0-1", "D0-3", "D0-2", "D0-4", "D7-1", "D7-5", "D7-2", "D7-4", "D14-3", "D14-5", "D14-1", "D14-4"))
+  ggplot(data = perc_dt) +
+    geom_violin(aes(x = sample, y = meth_perc, fill = genotype)) +
+    ylab("% CpG methylation in tile\n") +
+    xlab("\nsample") +
+    scale_x_discrete(labels = c("D0 rep1", "D0 rep2", "D0 rep1", "D0 rep2", "D7 rep1", "D7 rep2", "D7 rep1", "D7 rep2", "D14 rep1", "D14 rep2", "D14 rep1", "D14 rep2")) +
+    theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20), 
+          axis.text.x = element_text(angle = 45, hjust = 1), 
+          title = element_text(size = 18),
+          legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+          legend.key.height = unit(1.5,"line"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black"))
+}
+
+
+global_meth_violin(mrl_tiles_200)
+
+```
+
+```{r corr between biol reps, setup, include = TRUE, fig.height=12, fig.width=15, eval = FALSE}
+
+## run just once because it takes a lot of time
+
+make_dt_for_corr_chart <- function (obj_list, sample_names_vector) {
+  make_perc_dt <- function (obj) {
+    dt <- data.table(chr = obj$chr, start = obj$start, end = obj$end, meth_perc = 100*obj$numCs/obj$coverage)
+    names(dt)[4] <- obj@sample.id
+    return(dt)
+  }
+  perc_dt <- as.data.frame(Reduce(function(...) merge(..., by = c("chr", "start", "end")), lapply(obj_list, make_perc_dt)))
+  return(perc_dt[, sample_names_vector])
+}
+
+library("PerformanceAnalytics")
+chart.Correlation(make_dt_for_corr_chart(obj_list = mrl_tiles_200, sample_names_vector = c("D0-1", "D0-3", "D0-2", "D0-4")), histogram=FALSE, pch=19)
+chart.Correlation(make_dt_for_corr_chart(obj_list = mrl_tiles_200, sample_names_vector = c("D7-1", "D7-5", "D7-2", "D7-4")), histogram=FALSE, pch=19)
+chart.Correlation(make_dt_for_corr_chart(obj_list = mrl_tiles_200, sample_names_vector = c("D14-3", "D14-5", "D14-1", "D14-4")), histogram=FALSE, pch=19)
+
+```
+
+```{r unify samples, setup}
+
+# merging samples into a single table for comparison analysis
+meth_200_dt <- methylKit::unite(mrl_tiles_200)
+rm(mrl_tiles_200)
+meth_50_dt <- methylKit::unite(mrl_tiles_50)
+meth_prom_dt <- methylKit::unite(mrl_TSS)
+meth_CGI_dt <- methylKit::unite(mrl_nonProm_CGI)
+
+```
+
+## Checking any presence of batch effects using methylation count over 200 CpG tiles
+
+```{r samples pca, setup, include = TRUE, fig.height=10, fig.width=12}
+
+pc_obj <- PCASamples(meth_200_dt, obj.return = TRUE, adj.lim=c(1,1), screeplot = TRUE)
+
+d <- data.frame(PC1 = pc_obj$x[, 1], PC2 = pc_obj$x[, 2], PC3 = pc_obj$x[, 3], PC4 = pc_obj$x[, 4], sample = rownames(pc_obj$x), genotype = ifelse(meth_200_dt@treatment == 0, "WT", "KO"))
+
+ggplot(data = d, aes(x = PC1, y = PC2)) +
+  geom_point(aes(colour = genotype), size = 3) +
+  geom_text(aes(label = sample), size = 8, hjust = 0, angle = 45, vjust = -0.5) +
+  ggtitle("Based on methylation count in 200 CpG tiles") +
+  theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20),
+        title = element_text(size = 18),
+        legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+        legend.key.height = unit(1.5,"line"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+
+```
+
+```{r removing objects not needed anymore to clear space, setup}
+
+rm(meth_200_dt)
+
+```
+
+# Methylation by genomic features
+
+```{r reading annotation, setup}
+
+genome_annotation_bed <- "../../data/annotations/gencode.vM25.annotation.bed"
+gene_features <- readTranscriptFeatures(genome_annotation_bed, remove.unusual=TRUE, 
+                                        up.flank=1000, down.flank=1000, unique.prom=TRUE)
+
+```
+
+I annotate tiles with genomic features using genome annotation `r genome_annotation_bed`.
+
+```{r relevel methylBase chr factor, setup}
+
+# need to add "chr" to chr factor levels in all methylBase obj to make them compatible with annotation granges obj
+relevel_chr_factor <- function (methyl_obj) {
+  levels(methyl_obj[[1]]) <- paste0("chr", levels(methyl_obj[[1]]))
+  return(methyl_obj)
+}
+meth_50_dt <- relevel_chr_factor(meth_50_dt)
+meth_prom_dt <- relevel_chr_factor(meth_prom_dt)
+meth_CGI_dt <- relevel_chr_factor(meth_CGI_dt)
+
+# need to convert methylBase object into GRanges for usage with genomation
+meth_50_gr <- as(meth_50_dt, "GRanges")
+meth_prom_gr <- as(meth_prom_dt, "GRanges")
+meth_CGI_gr <- as(meth_CGI_dt, "GRanges")
+
+```
+
+## Relationship between CpG density of a tile and its bias towards certain features
+
+I assume that tiles of different width (i.e. different CpG density) will be biased towards certain features because of the organization of CpGs in the genome.
+
+<n>
+
+Therefore, I first of all bin the width of tiles and plot the annotation result using different bins of tiles' width i.e. different bins of CpG density.
+
+```{r annotating by bins, setup, fig.height=22, fig.width=20, include = TRUE}
+
+## function that annotates meth counts with gene parts and make barplots of 1. percentage of target features overlapping with annotation and 2. same as 1 but respecting feature precedence
+annotate_and_barplot_bins <- function (methyl_obj, my_annotation, my_breaks, my_title) {
+  # Binning the width of CpG tiles
+  width_bins <- cut(width(methyl_obj), breaks = my_breaks)
+  annotate_and_barplot <- function (b, methyl_obj, my_annotation) {
+    # taking only tiles corresponding to that bin
+    methyl_obj_s <- methyl_obj[which(width_bins == b)]
+    # annotating tiles
+    methyl_annotation <- annotateWithGeneParts(methyl_obj_s, my_annotation)
+    # data.table for plotting, which needs to be melted
+    bp_dt <- data.table(feature = names(methyl_annotation@annotation), perc = methyl_annotation@annotation, perc_w_precedence = methyl_annotation@precedence)
+    bp_dt_m <- melt(bp_dt, id.vars = "feature")
+    # order feature character vector by feature precedence
+    bp_dt_m$feature <- factor(bp_dt_m$feature, levels = names(methyl_annotation@annotation))
+    ggplot(data = bp_dt_m) +
+      geom_bar(aes(feature, value, fill = variable), stat = "identity", position = "dodge") +
+      xlab("gene feature") +
+      ylab("percentage of tiles") +
+      ggtitle(paste0(my_title, "\n", b, "\nN = ", length(methyl_obj_s))) +
+      scale_fill_discrete(labels = c("without features' precedence", "with features' precedence")) +
+      theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20), 
+            axis.text.x = element_text(angle = 45, hjust = 1), 
+            title = element_text(size = 18),
+            legend.text = element_text(size = 20), legend.title = element_blank(),
+            legend.key.height = unit(1.5,"line"),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_blank(),
+            axis.line = element_line(colour = "black"))
+  }
+  do.call("ggarrange", args = list(plotlist = lapply(levels(width_bins), FUN = annotate_and_barplot, methyl_obj = methyl_obj, my_annotation = my_annotation), common.legend = TRUE, legend = "top"))
+}
+
+# Applying the function to all width bins
+annotate_and_barplot_bins(methyl_obj = meth_50_gr, my_annotation = gene_features, my_breaks = c(0, 1000, 5000, max(width(meth_50_gr))), my_title = "")
+
+```
+
+It is clear that the bins [0, 1000), [1000, 5000) and > 10000 are more associated to CpG rich promoters, gene body and intergenic regions (and CpG shores), respectively.
+
+## Methylation distribution for tiles annotated by genomic features, High and Low CpG promoters and non-promoters CpG Islands
+
+```{r pooling biol repl, setup}
+
+## Function which produces data.table of mean methylation percentage among biological replicates for each region of input GRanges obj
+pool_biol_rep <- function (my_gr_obj, my_mb_obj, my_samples_table) {
+  # Function which computes methylation percentage for each sample. It also calculates percentage of CpG for tiles as (e.g. for 50 CpG tiles) 50/widthOfTheTile*100
+  make_perc_table <- function (gr_obj, mb_obj, sample_nr) {
+    perc_dt <- data.table(seqnames = as.character(seqnames(gr_obj)), start = start(gr_obj), end = end(gr_obj), width = width(gr_obj), perCpg = 50/width(gr_obj)*100, meth_perc = 100*mcols(gr_obj)[, paste0("numCs", sample_nr)]/mcols(gr_obj)[, paste0("coverage", sample_nr)], sample_name = rep(mb_obj@sample.ids[sample_nr], times = nrow(mcols(gr_obj))))
+  return(perc_dt)
+  }
+  # Applying the function to all samples and merging all samples in same dt
+  perc_dt_all <- do.call("rbind", lapply(X = 1:length(my_mb_obj@sample.ids), FUN = make_perc_table, gr_obj = my_gr_obj, mb_obj = my_mb_obj))
+  setkey(perc_dt_all, sample_name)
+  # Computing average of meth perc for biol repl (i.e. samples sharing condition and time point)
+  setkey(my_samples_table, sample_name)
+  perc_dt_all <- merge(perc_dt_all, my_samples_table[, .(sample_name, group_or_time_point, condition)], by = "sample_name")
+  return(perc_dt_all[, .(meth_perc = mean(meth_perc)), by = .(seqnames, start, end, perCpg, group_or_time_point, condition)])
+}
+
+meth_50_pooled_dt <- pool_biol_rep(my_gr_obj = meth_50_gr, my_mb_obj = meth_50_dt, my_samples_table = samples_table)
+meth_prom_pooled_dt <- pool_biol_rep(my_gr_obj = meth_prom_gr, my_mb_obj = meth_prom_dt, my_samples_table = samples_table)
+meth_CGI_pooled_dt <- pool_biol_rep(my_gr_obj = meth_CGI_gr, my_mb_obj = meth_CGI_dt, my_samples_table = samples_table)
+# CpG density computed as in the above function does not make sense for prom and CGI because for the latters the meth was calculated on given windows instead of 50 CpG tiles of variable length
+meth_CGI_pooled_dt$perCpg <- NULL
+meth_prom_pooled_dt$perCpg <- NULL
+
+```
+
+```{r subsetting tiles by feature, setup}
+
+## function which takes a GRanges object and split it by the annotation generated with genomation function 'annotateWithGeneParts'. It assigns granges overlapping to more than one feature according to the features' precedence order enstablished by 'annotateWithGeneParts'
+split_gr_by_annotation <- function (my_target, my_annotation) {
+  # annotating tiles --> the feature corresponding to each tile is in the slot @members of the AnnotationByGeneParts object
+  my_AnnotByGeneParts <- annotateWithGeneParts(my_target, my_annotation)
+  feature_num <- ifelse(my_AnnotByGeneParts@members[, "prom"] == 1, 1, 0)
+  feature_num[my_AnnotByGeneParts@members[, 1] == 0 & my_AnnotByGeneParts@members[, 2] == 1] <- "2"
+  feature_num[rowSums(my_AnnotByGeneParts@members[, 1:2]) == 0 & my_AnnotByGeneParts@members[, 3] == 1] <-"3"
+  feature_num[rowSums(my_AnnotByGeneParts@members[, 1:3]) == 0] <- "4"
+  grl_by_feature <- split(x = my_target, f = feature_num)
+  names(grl_by_feature) <- names(my_AnnotByGeneParts@precedence)
+  return(as(grl_by_feature, "GRangesList"))
+}
+
+perc_by_feature_grl <- split_gr_by_annotation(my_target = as(meth_50_pooled_dt, "GRanges"), my_annotation = gene_features)
+
+```
+
+```{r removing TE-overlapping intergenic tiles, setup}
+
+# loading Transposable Elements (TE) annotation used to count methylation on TE
+TE_annotation_bed <- "../../data/annotations/RepeatMasker_RepeatLibrary20140131_mm10.noGenes.noSimple.bed"
+TE_anno <- fread(TE_annotation_bed, fill = TRUE, col.names = c("seqnames", "start", "end", "repName", "length", "strand", "repFamClass"))
+# adding +1 to start, necessary for compatibility with 1-based methylBase-derived objects because bed file coordinates are 0-based
+TE_anno$start <- TE_anno$start + 1
+
+# removing TE-overlapping tiles from tiles annotated as intergenic
+TE_ov <- findOverlaps(as(TE_anno, "GRanges"), perc_by_feature_grl$intergenic, maxgap=-1L, minoverlap=0L, type=c("any"), ignore.strand=TRUE)
+TE_ov_indices <- unique(TE_ov@to)
+perc_by_feature_grl$intergenic <- perc_by_feature_grl$intergenic[-unique(TE_ov@to)]
+
+```
+
+```{r HCG and LCG promoters, setup}
+
+# reading promoters bed file as GRanges object and keeping transcripts' name information 
+promoters <- readGeneric("../../data/annotations/TSS_900bp.bed", 
+            keep.all.metadata = TRUE, meta.cols = list(transcript_id=4, CpG_type=5),
+            zero.based = TRUE)
+# removing version from transcripts' names for better compatibility
+promoters$transcript_id <- gsub("\\..*$", "", promoters$transcript_id)
+
+# reading list of HCGs and LCGs transcripts' names
+LCG_transcripts <- unlist(fread("../../analysis/CpG_analysis/LCG_transcripts.txt", header = FALSE))
+HCG_transcripts <- unlist(fread("../../analysis/CpG_analysis/HCG_transcripts.txt", header = FALSE))
+
+promoters$CpG_type <- ifelse(promoters$transcript_id %in% HCG_transcripts, "HCG", "LCG")
+promoters$CpG_type[promoters$CpG_type == "LCG" & !(promoters$transcript_id %in% LCG_transcripts)] <- "NC"
+
+# reading values of obsExp CpG ratio and percentage of CpG for all promoters
+promoters_CpG_dt <- fread("../../analysis/CpG_analysis/promoters_CpG_df.txt")
+promoters_dt <- merge(as.data.table(promoters)[, 1:7], promoters_CpG_dt, by = "transcript_id")
+
+# merging promot meth count table with these the other promoters info
+meth_prom_pooled_dt <- merge(as.data.table(meth_prom_pooled_dt), promoters_dt, by = c("seqnames", "start", "end"))
+
+meth_prom_pooled_type_list <- split(meth_prom_pooled_dt, f = meth_prom_pooled_dt$CpG_type)
+
+```
+
+```{r adding perCpG to CGIs, setup}
+
+CGI_dt <- fread("../../data/annotations/UCSC_CGI_mm10.txt", drop = c(1, 5))
+names(CGI_dt)[1:3] <- c("seqnames", "start", "end") 
+CGI_dt$start <- CGI_dt$start + 1 #necessary because the UCSC table coordinates are 0-based, while now all pooled dt are 1-based 
+meth_CGI_pooled_dt <- merge(meth_CGI_pooled_dt, CGI_dt, by = c("seqnames", "start", "end"), all.x = TRUE, all.y = FALSE)
+
+```
+
+```{r adding prom and CGI to feature grl, setup}
+
+perc_by_feature_grl[["HCG_promoters"]] <- as(meth_prom_pooled_type_list$HCG, "GRanges")
+perc_by_feature_grl[["LCG_promoters"]] <- as(meth_prom_pooled_type_list$LCG, "GRanges")
+perc_by_feature_grl[["non_promoter_CGI"]] <- as(meth_CGI_pooled_dt, "GRanges")
+
+```
+
+* I annotate the 50 CpG tiles with genomic features, except for promoters, using the following precedence: `r names(perc_by_feature_grl)`. From tiles annotated as intergenic, I remove all the ones which also overlap a repeat element used to count over Transposable Elements (i.e. a repeat element in `r TE_annotation_bed`). 
+* Separately (in a rule in Snakefile on the cluster), I had counted methylation over promoters (900bp windows around TSS); I load this methylation count and separate promoters in High CpG (HCG) and Low CpG (LCG) density promoters, based on the list of HCG and LCG transcript IDs produced in script ../R/TSSs_CpG.R.
+* Separately (in another rule in Snakefile on the cluster), I had counted methylation over those UCSC CpG Islands (CGI) track for mm10 that do not overlap with the 900-bp promoters.
+* I make violin plots for tiles belonging to the different features, binned based on their width i.e. their CpG density, as well as for promoters and non-promoter CGIs.
+
+<n>
+
+For each genotype and time point, the average of the two different biological replicates is shown.
+
+```{r methyl violins by feature, setup, include = TRUE, fig.height=10, fig.width=15}
+
+meth_violin_by_feature <- function (my_gr_obj_list, bin_width, width_lim) {
+  perc_dt_all_features <- rbindlist(lapply(my_gr_obj_list, as.data.table), idcol = "feature")
+  perc_dt_all_features$condition <- factor(perc_dt_all_features$condition, levels = c("WT", "KO"))
+  if (bin_width) {
+    perc_dt_all_features <- perc_dt_all_features[width >= width_lim[1] & width < width_lim[2]]
+  }
+  perc_dt_all_features$feature <- gsub("_", " ", factor(perc_dt_all_features$feature, levels = names(my_gr_obj_list)))
+  perc_dt_all_features$feature[perc_dt_all_features$feature == "exon"] <- "exons"
+  perc_dt_all_features$feature[perc_dt_all_features$feature == "intron"] <- "introns"
+  ggviolin(perc_dt_all_features,
+           x = "group_or_time_point", y = "meth_perc", 
+           fill = "condition",
+           ylab = "% CpG methylation\n",
+           xlab = "\nsample",
+           facet.by = "feature", panel.labs.font = list(size = 18)) +
+    scale_x_discrete(labels = c("D0", "D7", "D14")) +
+    scale_y_continuous(limits = c(0,100)) +
+    scale_fill_discrete(name= "genotype") +
+    ggtitle(paste0("[",min(perc_dt_all_features$width), ",", max(perc_dt_all_features$width), ")")) +
+    theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20), 
+          axis.text.x = element_text(angle = 45, hjust = 1), 
+          title = element_text(size = 18),
+          legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+          legend.key.height = unit(1.5,"line"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black"),
+          panel.border = element_rect(colour = "black", fill=NA))
+}
+
+meth_violin_by_feature(my_gr_obj_list = perc_by_feature_grl[2:4], bin_width = TRUE, width_lim = c(0,1000000))
+meth_violin_by_feature(my_gr_obj_list = perc_by_feature_grl[2:4], bin_width = TRUE, width_lim = c(0,1000))
+meth_violin_by_feature(my_gr_obj_list = perc_by_feature_grl[2:4], bin_width = TRUE, width_lim = c(1000,5000))
+meth_violin_by_feature(my_gr_obj_list = perc_by_feature_grl[2:4], bin_width = TRUE, width_lim = c(5000,1000000))
+meth_violin_by_feature(my_gr_obj_list = perc_by_feature_grl[5:7], bin_width = FALSE)
+
+```
+
+```{r saving objects for other Rmds, setup}
+
+save(meth_prom_pooled_dt, file = "meth_prom_pooled_dt.Rdata")
+save(meth_prom_pooled_type_list, file = "meth_prom_pooled_type_list.Rdata")
+save(meth_50_pooled_dt, file = "meth_50_pooled_dt.Rdata")
+
+```
+
+# A closer look at regions which are more resistant to demethylation
+
+Since most of the tiles/promoters/CGIs are demethylated in KO cells, it is more interesting to look at ***high CpG genomic regions which are more resistant to methylation loss***.
+
+The scripts ../R/CpG_tiles_counts.R, ../R/promoter_counts.R and ../R/nonPromoter_CGI_counts.R, run on the cluster, also perform differential methylation analysis of tiles, promoters and non-promoter CGIs, respectively. For the diff meth analysis I choose logistic regression and Chi-squared test with overdispersion.
+
+<n>
+
+I compute Differentially Methylated tiles/promoters/CGIs both:
+
+* between WT and KO genotype, for each time point
+* between time points, for each genotype
+
+```{r diff meth objects, setup}
+
+# loading the methyldiff objects
+load("../R/dm_prom_geno_for_each_tp.Rdata")
+load("../R/dm_prom_tp_for_each_geno_0vs14d.Rdata")
+load("../R/dm_prom_tp_for_each_geno_0vs7d.Rdata")
+load("../R/dm_prom_tp_for_each_geno_7vs14d.Rdata")
+dm_prom_geno_for_each_tp <- dm_geno_for_each_tp
+dm_prom_tp_for_each_geno_0vs14d <- dm_tp_for_each_geno_0vs14d
+dm_prom_tp_for_each_geno_0vs7d <- dm_tp_for_each_geno_0vs7d
+dm_prom_tp_for_each_geno_7vs14d <- dm_tp_for_each_geno_7vs14d
+
+load("../R/dm_CGI_geno_for_each_tp.Rdata")
+load("../R/dm_CGI_tp_for_each_geno_0vs14d.Rdata")
+load("../R/dm_CGI_tp_for_each_geno_0vs7d.Rdata")
+load("../R/dm_CGI_tp_for_each_geno_7vs14d.Rdata")
+
+load("../R/dmt_50_geno_for_each_tp.Rdata")
+load("../R/dmt_50_tp_for_each_geno_0vs14d.Rdata")
+load("../R/dmt_50_tp_for_each_geno_0vs7d.Rdata")
+load("../R/dm_prom_tp_for_each_geno_7vs14d.Rdata")
+
+```
+
+```{r qval threshold, setup}
+
+# setting threshold for q-value
+qval_threshold <- 0.05
+                                   
+```
+
+## Hypermethylated promoters and CGIs
+
+I firstly check whether there are significantly hypermethylated promoters and CGIs.
+
+```{r hypermeth, setup}
+
+## function to subset methyldiff object on qvalue and meth difference thresholds
+subset_by_qval <- function (methyldiff_obj, my_qval, my_diff, my_type) {
+  getData(getMethylDiff(methyldiff_obj, difference = my_diff, qvalue = my_qval, type = my_type))
+}
+  
+dm_prom_geno_for_each_tp_hyper <- lapply(dm_prom_geno_for_each_tp, FUN = subset_by_qval, my_qval = qval_threshold, my_diff = 40, my_type = "hyper")
+prom_hyper_all_tp <- nrow(Reduce(function(...) merge(..., by = c("chr", "start", "end")), dm_prom_geno_for_each_tp_hyper))
+
+dm_CGI_geno_for_each_tp_hyper <- lapply(dm_geno_for_each_tp, FUN = subset_by_qval, my_qval = qval_threshold, my_diff = 40, my_type = "hyper")
+CGI_hyper_all_tp <- nrow(Reduce(function(...) merge(..., by = c("chr", "start", "end")), dm_CGI_geno_for_each_tp_hyper))
+
+```
+
+The test found:
+
+* `r lapply(dm_prom_geno_for_each_tp_hyper, function (mdo) {nrow(mdo)})` promoters out of `r lapply(dm_prom_geno_for_each_tp, function (mdo) {nrow(mdo)})` to be at least 40% hypermethylated below my threshold qvalue < `r qval_threshold` between WT and KO at the 0, 14 days and 7 days time points, respectively
+* `r lapply(dm_CGI_geno_for_each_tp_hyper, function (mdo) {nrow(mdo)})` non-promoter CGIs out of `r lapply(dm_geno_for_each_tp, function (mdo) {nrow(mdo)})` to be at least 40% hypermethylated below my threshold qvalue < `r qval_threshold` between WT and KO at the 0, 14 days and 7 days time points, respectively
+
+However, only `r prom_hyper_all_tp` and `r CGI_hyper_all_tp` hypermeth promoters and CGIs are shared between time points, respectively.
+
+## Different dynamics of demethylation - some regions are indeed more resistant to demethylation
+
+Even though there is no significant hypermethylation, some high CpG genomic regions could loose methylation at later time points / to a lesser extent than others. To investigate this, I plot both a heatmap and a scatterplot.
+
+```{r merging diffmeth info with complete meth infos, setup}
+
+# make one methdiff dt for all time points
+make_one_methdiff_dt <- function (methdiff_obj_list) {
+  dm_dt_list <- lapply(methdiff_obj_list, getData)
+  names(dm_dt_list) <- lapply(methdiff_obj_list, function(md_obj){unique(gsub("-.*", "", md_obj@sample.ids))})
+  dm_dt_list <- lapply(1:length(dm_dt_list), function(i){colnames(dm_dt_list[[i]])[5:7] <- paste0(colnames(dm_dt_list[[i]])[5:7], ".", names(dm_dt_list)[[i]]); return(dm_dt_list[[i]])})
+  dm_all <- Reduce(function(...) merge(..., by = c("chr", "start", "end", "strand"), all = TRUE), dm_dt_list)
+  colnames(dm_all)[1] <- "seqnames"
+  relevel_chr_factor(dm_all)
+}
+dm_prom_geno_all <- make_one_methdiff_dt(dm_prom_geno_for_each_tp)
+dm_CGI_geno_all <- make_one_methdiff_dt(dm_geno_for_each_tp)
+dm_tiles_geno_all <- make_one_methdiff_dt(dmt_50_geno_for_each_tp)
+
+# merging diffmeth dt with methylation dt containing complete infos on meth in different samples and CpG density values
+dmAndMeth_HCG_prom_pooled_dt <- as.data.table(merge(dm_prom_geno_all, meth_prom_pooled_type_list$HCG, by = c("seqnames", "start", "end", "strand")))
+rm(dm_prom_geno_all)
+rm(meth_prom_pooled_type_list)
+dmAndMeth_CGI_pooled_dt <- as.data.table(merge(dm_CGI_geno_all, meth_CGI_pooled_dt, by = c("seqnames", "start", "end")))
+rm(dm_CGI_geno_all,meth_CGI_pooled_dt )
+dmAndMeth_tiles_pooled_dt <- as.data.table(merge(dm_tiles_geno_all, meth_50_pooled_dt, by = c("seqnames", "start", "end")))
+rm(dm_tiles_geno_all)
+rm(meth_50_pooled_dt)
+
+```
+
+### Heatmap
+
+For the heatmap below, I choose those HCG promoters which have a percentage of methylation in WT condition at time 0 > `r quantile(dmAndMeth_HCG_prom_pooled_dt[condition == "WT" & group_or_time_point == 1]$meth_perc, probs=seq(0,1,0.1))[10]` (10th percentile of meth percentage in WT condition at time 0) and cluster them based on the difference between WT and KO methylation for the three time points. The heatmap shows that there are clusters of promoters which loose all methylation already at Day0, clusters which loose it at Day7 and clusters which loose it later. Hclustering does not seem to do a good job though, therefore I will use kmean clustering (see below).
+
+```{r heatmap meth dynamics, setup, include = TRUE, fig.height=10, fig.width=15}
+
+# Select only guys which are highly methylated in wild-type condition at time 0
+high_meth_HCG_prom <- dmAndMeth_HCG_prom_pooled_dt[condition == "WT" & group_or_time_point == 1 & meth_perc>quantile(dmAndMeth_HCG_prom_pooled_dt[condition == "WT" & group_or_time_point == 1]$meth_perc, probs=seq(0,1,0.1))[10]]
+
+# Making the table suitable for pheatmap
+methdiff_cols <- grep("meth.diff", colnames(dmAndMeth_HCG_prom_pooled_dt), value = TRUE)
+pheat_dt <- high_meth_HCG_prom[, lapply(.SD, unique), by = .(transcript_id), .SDcols = c(methdiff_cols, "perCpg")]
+pheat_dt$transcript_id <- NULL
+pheat_df <- as.data.frame(pheat_dt)[, c(1,3,2)]
+rownames(pheat_df) <- paste0("row_", seq(nrow(pheat_df)))
+
+pheat_anno <- data.frame(perCpg = pheat_dt$perCpg, row.names = row.names(pheat_df))
+
+pheatmap(pheat_df, cluster_rows = TRUE, cluster_cols = TRUE, annotation_row = pheat_anno, show_rownames = FALSE, clustering_distance_rows = "manhattan", clustering_distance_cols = "manhattan", fontsize = 20)
+
+```
+
+### Scatterplot
+
+I plot only 50 CpG tiles, HCG promoters and non-promoter CGIs having a perCpg higher than 1/16*100.
+
+```{r wt vs ko scatter, setup, fig.height=15, fig.width=15}
+
+scatter_meth <- function (complete_dt, my_perCpg_threshold, my_title) {
+  # selecting only ranges with high CpG density
+  hcg_guys <- complete_dt[perCpg > my_perCpg_threshold]
+  # making a wide data.table (with one row per unique genomic range and meth perc for all combinations of time point and conditions on the columns)
+  dt_wide <- dcast(hcg_guys, seqnames + start + end + perCpg ~ condition + group_or_time_point, fun.aggregate = NULL, value.var = "meth_perc")
+  ggplot(data = dt_wide) +
+    geom_point(aes(x = WT_1, y = KO_1), alpha = 0.8, color = "#1c9099") +
+    geom_point(aes(x = WT_2, y = KO_2), alpha = 0.5, color = "#a6bddb") +
+    geom_point(aes(x = WT_3, y = KO_3), alpha = 0.5, color = "#ece2f0") +
+    scale_x_continuous(limits = c(0,100)) +
+    scale_y_continuous(limits = c(0,100)) +
+    xlab("WT") +
+    ylab("KO") +
+    ggtitle(my_title) +
+    theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20), 
+          title = element_text(size = 20),
+          legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+          legend.key.height = unit(1.5,"line"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line = element_line(colour = "black"),
+          panel.border = element_rect(colour = "black", fill=NA))
+} 
+
+a <- scatter_meth(dmAndMeth_tiles_pooled_dt, my_perCpg_threshold = 100/16, my_title = "50 CpG tiles")
+b <- scatter_meth(dmAndMeth_HCG_prom_pooled_dt, my_perCpg_threshold = 100/16, my_title = "HCG promoters")
+c <- scatter_meth(dmAndMeth_CGI_pooled_dt, my_perCpg_threshold = 100/16, my_title = "non-promoters CGIs")
+ggarrange(a,b,c)
+
+```
+
+## Kmeans clustering of HCG regions with high percentage of WT methylation
+
+### Tiles
+
+```{r wt vs ko scatter colored by kmeans, setup, fig.height=15, fig.width=15}
+
+perCpg_threshold <- 100/16
+wt_meth_threshold <- 75
+
+scatter_and_cluster_meth <- function (complete_dt, my_perCpg_threshold, my_wt_meth_threshold) {
+  # selecting only ranges with high CpG density
+  hcg_guys <- complete_dt[perCpg > my_perCpg_threshold]
+  # making a wide data.table (with one row per unique genomic range and meth perc for all combinations of time point and conditions on the columns)
+  dt_wide <- dcast(hcg_guys, seqnames + start + end + perCpg ~ condition + group_or_time_point, fun.aggregate = NULL, value.var = "meth_perc")
+  # computing kmeans clustering only on ranges highly methylated in wt
+  kmeans_res <- kmeans(as.matrix(dt_wide[WT_1 > my_wt_meth_threshold & WT_2 > my_wt_meth_threshold & WT_3 > my_wt_meth_threshold, 5:10]), centers = 4)
+  clusters <- kmeans_res$cluster
+  # adding assigned cluster as column in wide dt
+  dt_wide$cluster <- "none"
+  dt_wide$cluster[dt_wide$WT_1 > my_wt_meth_threshold & dt_wide$WT_2 > my_wt_meth_threshold & dt_wide$WT_3 > my_wt_meth_threshold] <- clusters
+  highly_resistant_cluster <- names(which.max(rowMeans(kmeans_res$centers)))
+  less_resistant_cluster <- names(which.max(rowMeans(kmeans_res$centers[-which.max(rowMeans(kmeans_res$centers)),])))
+  D0_loosing_cluster <- names(which.min(rowMeans(kmeans_res$centers)))
+  later_loosing_cluster <- names(which.min(rowMeans(kmeans_res$centers[-which.min(rowMeans(kmeans_res$centers)),])))
+  dt_wide$cluster[dt_wide$cluster == highly_resistant_cluster] <- "highly resistant"
+  dt_wide$cluster[dt_wide$cluster == less_resistant_cluster] <- "less resistant"
+  dt_wide$cluster[dt_wide$cluster == D0_loosing_cluster] <- "D0 loosing"
+  dt_wide$cluster[dt_wide$cluster == later_loosing_cluster] <- "later loosing"
+  tp1 <- ggplot(data = dt_wide) +
+          geom_point(aes(x = WT_1, y = KO_1, color = cluster), size = 1, alpha = 0.7) +
+          scale_colour_manual(values = c("none" = "grey", "highly resistant" = "#7CAE00", "less resistant" = "#00BFC4", "later loosing" = "#F8766D", "D0 loosing" = "#C77CFF")) +
+          scale_x_continuous(limits = c(0,100)) +
+          scale_y_continuous(limits = c(0,100)) +
+          xlab("WT") +
+          ylab("KO") +
+          ggtitle("D0") +
+          theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20), 
+            title = element_text(size = 20),
+            legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+            legend.key.height = unit(1.5,"line"),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_blank(),
+            axis.line = element_line(colour = "black"),
+            panel.border = element_rect(colour = "black", fill=NA))
+  tp2 <- ggplot(data = dt_wide) +
+          geom_point(aes(x = WT_2, y = KO_2, color = cluster), size = 1, alpha = 0.7) +
+          scale_colour_manual(values = c("none" = "grey", "highly resistant" = "#7CAE00", "less resistant" = "#00BFC4", "later loosing" = "#F8766D", "D0 loosing" = "#C77CFF")) +
+          scale_x_continuous(limits = c(0,100)) +
+          scale_y_continuous(limits = c(0,100)) +
+          xlab("WT") +
+          ylab("KO") +
+          ggtitle("D7") +
+          theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20), 
+            title = element_text(size = 20),
+            legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+            legend.key.height = unit(1.5,"line"),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_blank(),
+            axis.line = element_line(colour = "black"),
+            panel.border = element_rect(colour = "black", fill=NA))
+  tp3 <- ggplot(data = dt_wide) +
+          geom_point(aes(x = WT_3, y = KO_3, color = cluster), size = 1, alpha = 0.7) +
+          scale_colour_manual(values = c("none" = "grey", "highly resistant" = "#7CAE00", "less resistant" = "#00BFC4", "later loosing" = "#F8766D", "D0 loosing" = "#C77CFF")) +
+          scale_x_continuous(limits = c(0,100)) +
+          scale_y_continuous(limits = c(0,100)) +
+          xlab("WT") +
+          ylab("KO") +
+          ggtitle("D14") +
+          theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20), 
+            title = element_text(size = 20),
+            legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+            legend.key.height = unit(1.5,"line"),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_blank(),
+            axis.line = element_line(colour = "black"),
+            panel.border = element_rect(colour = "black", fill=NA))
+  ggarrange(tp1, tp2, tp3, common.legend = TRUE)
+} 
+
+scatter_and_cluster_meth(dmAndMeth_tiles_pooled_dt, my_perCpg_threshold = 100/16, my_wt_meth_threshold = wt_meth_threshold)
+
+```
+
+### Promoters
+
+```{r wt vs ko scatter colored by kmeans 2, setup, fig.height=15, fig.width=15}
+
+scatter_and_cluster_meth_prom <- function (complete_dt, my_perCpg_threshold, my_wt_meth_threshold) {
+  # selecting only ranges with high CpG density
+  hcg_guys <- complete_dt[perCpg > my_perCpg_threshold]
+  # making a wide data.table (with one row per unique genomic range and meth perc for all combinations of time point and conditions on the columns)
+  dt_wide <- dcast(hcg_guys, seqnames + start + end + perCpg ~ condition + group_or_time_point, fun.aggregate = NULL, value.var = "meth_perc")
+  # computing kmeans clustering only on ranges highly methylated in wt
+  kmeans_res <- kmeans(as.matrix(dt_wide[WT_1 > my_wt_meth_threshold & WT_2 > my_wt_meth_threshold & WT_3 > my_wt_meth_threshold, 5:10]), centers = 4)
+  clusters <- kmeans_res$cluster
+  # adding assigned cluster as column in wide dt
+  dt_wide$cluster <- "none"
+  dt_wide$cluster[dt_wide$WT_1 > my_wt_meth_threshold & dt_wide$WT_2 > my_wt_meth_threshold & dt_wide$WT_3 > my_wt_meth_threshold] <- clusters
+  highly_resistant_cluster <- names(which.max(rowMeans(kmeans_res$centers)))
+  less_resistant_cluster <- names(which.max(rowMeans(kmeans_res$centers[-which.max(rowMeans(kmeans_res$centers)),])))
+  D0_loosing_cluster <- names(which.min(rowMeans(kmeans_res$centers)))
+  later_loosing_cluster <- names(which.min(rowMeans(kmeans_res$centers[-which.min(rowMeans(kmeans_res$centers)),])))
+  # for promoters, merging D0 loosing and later loosing in one cluster because the sparcity of the data makes the two clusters undistinguishable/separation is too noisy 
+  dt_wide$cluster[dt_wide$cluster == highly_resistant_cluster] <- "highly resistant"
+  dt_wide$cluster[dt_wide$cluster == less_resistant_cluster] <- "less resistant"
+  dt_wide$cluster[dt_wide$cluster == D0_loosing_cluster] <- "D0 loosing"
+  dt_wide$cluster[dt_wide$cluster == later_loosing_cluster] <- "D0 loosing"
+  tp1 <- ggplot(data = dt_wide) +
+          geom_point(aes(x = WT_1, y = KO_1, color = cluster), size = 1, alpha = 0.7) +
+          scale_colour_manual(values = c("none" = "grey", "highly resistant" = "#7CAE00", "less resistant" = "#00BFC4", "D0 loosing" = "#C77CFF")) +
+          scale_x_continuous(limits = c(0,100)) +
+          scale_y_continuous(limits = c(0,100)) +
+          xlab("WT") +
+          ylab("KO") +
+          ggtitle("D0") +
+          theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20), 
+            title = element_text(size = 20),
+            legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+            legend.key.height = unit(1.5,"line"),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_blank(),
+            axis.line = element_line(colour = "black"),
+            panel.border = element_rect(colour = "black", fill=NA))
+  tp2 <- ggplot(data = dt_wide) +
+          geom_point(aes(x = WT_2, y = KO_2, color = cluster), size = 1, alpha = 0.7) +
+          scale_colour_manual(values = c("none" = "grey", "highly resistant" = "#7CAE00", "less resistant" = "#00BFC4", "D0 loosing" = "#C77CFF")) +
+          scale_x_continuous(limits = c(0,100)) +
+          scale_y_continuous(limits = c(0,100)) +
+          xlab("WT") +
+          ylab("KO") +
+          ggtitle("D7") +
+          theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20), 
+            title = element_text(size = 20),
+            legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+            legend.key.height = unit(1.5,"line"),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_blank(),
+            axis.line = element_line(colour = "black"),
+            panel.border = element_rect(colour = "black", fill=NA))
+  tp3 <- ggplot(data = dt_wide) +
+          geom_point(aes(x = WT_3, y = KO_3, color = cluster), size = 1, alpha = 0.7) +
+          scale_colour_manual(values = c("none" = "grey", "highly resistant" = "#7CAE00", "less resistant" = "#00BFC4", "D0 loosing" = "#C77CFF")) +
+          scale_x_continuous(limits = c(0,100)) +
+          scale_y_continuous(limits = c(0,100)) +
+          xlab("WT") +
+          ylab("KO") +
+          ggtitle("D14") +
+          theme(axis.text = element_text(size = 20), axis.title = element_text(size = 20), 
+            title = element_text(size = 20),
+            legend.text = element_text(size = 20), legend.title = element_text(size = 20),
+            legend.key.height = unit(1.5,"line"),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.background = element_blank(),
+            axis.line = element_line(colour = "black"),
+            panel.border = element_rect(colour = "black", fill=NA))
+  ggarrange(tp1, tp2, tp3, common.legend = TRUE)
+} 
+
+
+scatter_and_cluster_meth_prom(dmAndMeth_HCG_prom_pooled_dt, my_perCpg_threshold = 100/16, my_wt_meth_threshold = wt_meth_threshold)
+
+```
+
+```{r wt vs ko scatter colored by kmeans 3, setup, fig.height=15, fig.width=15, eval = FALSE}
+
+scatter_and_cluster_meth(dmAndMeth_CGI_pooled_dt, my_perCpg_threshold = 100/16, my_wt_meth_threshold = wt_meth_threshold)
+
+```
+
+## Writing to external files for continuing investigation on databases
+
+I write to external files:
+
+1. the coordinates of HCG tiles/HCG promoters/non-promoters CGIs which are in the **resistant cluster** i.e. the cluster more at the top right at all time points
+2. the coordinates of HCG tiles/HCG promoters/non-promoters CGIs which are in all the other three non-resistant clusters i.e. all highly methylated and HCG ranges, because I will use them as background for motif-searching algorithms
+2. the coordinates, with also info on the associated transcripts, of HCG promoters belonging to two clusters:
+  + highly methylated in WT but immediately loosing methylation at D0: **D0 loosing cluster**
+  + highly methylated in WT but loosing methylation to a lesser extent than the D0 loosing cluster: **less resistant cluster**
+
+```{r exporting resistant guys, setup}
+
+get_resistance <- function (complete_dt, my_perCpg_threshold, my_wt_meth_threshold, my_ranges_type) {
+  # selecting only ranges with high CpG density
+  hcg_guys <- complete_dt[perCpg > my_perCpg_threshold]
+  # making wide data.table (with one row per unique genomic range and meth perc for all combinations of time point and conditions on the columns)
+  dt_wide <- dcast(hcg_guys, seqnames + start + end + perCpg ~ condition + group_or_time_point, fun.aggregate = NULL, value.var = "meth_perc")
+  # computing kmeans clustering only on ranges highly methylated in wt
+  kmeans_res <- kmeans(as.matrix(dt_wide[WT_1 > my_wt_meth_threshold & WT_2 > my_wt_meth_threshold & WT_3 > my_wt_meth_threshold, 5:10]), centers = 4)
+  clusters <- kmeans_res$cluster
+  # adding assigned cluster as column in wide dt
+  dt_wide$cluster <- "none"
+  dt_wide$cluster[dt_wide$WT_1 > my_wt_meth_threshold & dt_wide$WT_2 > my_wt_meth_threshold & dt_wide$WT_3 > my_wt_meth_threshold] <- clusters
+  highly_resistant_cluster <- names(which.max(rowMeans(kmeans_res$centers)))
+  less_resistant_cluster <- names(which.max(rowMeans(kmeans_res$centers[-which.max(rowMeans(kmeans_res$centers)),])))
+  D0_loosing_cluster <- names(which.min(rowMeans(kmeans_res$centers)))
+  later_loosing_cluster <- names(which.min(rowMeans(kmeans_res$centers[-which.min(rowMeans(kmeans_res$centers)),])))
+  dt_wide$cluster[dt_wide$cluster == highly_resistant_cluster] <- "highly_resistant"
+  dt_wide$cluster[dt_wide$cluster == less_resistant_cluster] <- "less_resistant"
+  dt_wide$cluster[dt_wide$cluster == D0_loosing_cluster] <- "D0_loosing"
+  dt_wide$cluster[dt_wide$cluster == later_loosing_cluster] <- "later_loosing"
+  resistant_bed <- dt_wide[cluster == "highly_resistant", .(seqnames, start, end, name = paste0(seqnames, "_", start, "_", end), perCpg, strand = rep(".", nrow(dt_wide[cluster == "highly_resistant"])))]
+  dir <- "../../analysis/meth_dynamics/"
+  write.table(resistant_bed, file = paste0(dir, "highly_resistant_", my_ranges_type, ".bed"), col.names = FALSE, row.names = FALSE, quote = FALSE, sep = "\t")
+  # exporting also all highly-methylated-and-HCG ranges and all highly-methylated-and-HCG-nonResistant ranges, in order to use them to estimate background model in RSAT
+  all_bed <- dt_wide[!grepl("none", dt_wide$cluster), .(seqnames, start, end, name = paste0(seqnames, "_", start, "_", end), perCpg, strand = rep(".", nrow(dt_wide[!grepl("none", dt_wide$cluster)])))]
+  non_resistant_bed <- dt_wide[!grepl("none|resistant", dt_wide$cluster), .(seqnames, start, end, name = paste0(seqnames, "_", start, "_", end), perCpg, strand = rep(".", nrow(dt_wide[!grepl("none|resistant", dt_wide$cluster)])))]
+  write.table(all_bed, file = paste0(dir, "bg_", my_ranges_type, ".bed"), col.names = FALSE, row.names = FALSE, quote = FALSE, sep = "\t")
+  write.table(non_resistant_bed, file = paste0(dir, "nonResistant_", my_ranges_type, ".bed"), col.names = FALSE, row.names = FALSE, quote = FALSE, sep = "\t")
+  return(dt_wide)
+}
+
+tile_resistance_dt <- get_resistance(dmAndMeth_tiles_pooled_dt, my_perCpg_threshold = perCpg_threshold, my_wt_meth_threshold = wt_meth_threshold, my_ranges_type = "tiles")
+CGI_resistance_dt <- get_resistance(dmAndMeth_CGI_pooled_dt, my_perCpg_threshold = perCpg_threshold, my_wt_meth_threshold = wt_meth_threshold, my_ranges_type = "nonPromCGIs")
+prom_resistance_dt <- get_resistance(dmAndMeth_HCG_prom_pooled_dt, my_perCpg_threshold = perCpg_threshold, my_wt_meth_threshold = wt_meth_threshold, my_ranges_type = "prom")
+# for promoters, merging D0 loosing and later loosing in one cluster because the sparcity of the data makes the two clusters undistinguishable/separation is too noisy 
+prom_resistance_dt[cluster == "later_loosing"]$cluster <- "D0_loosing" 
+
+```
+
+```{r getting gene names, setup}
+
+# merging with promoters dt to get the transctipts IDs associated with the promoter ranges
+prom_resistance_anno <- merge(prom_resistance_dt[, .(seqnames, start, end, cluster, perCpg)], as.data.table(promoters)[, .(seqnames, start, end, transcript_id, strand = rep(".", nrow(as.data.table(promoters))))], by = c("seqnames", "start", "end"))
+
+ensembl <- useEnsembl(biomart = "ensembl", dataset = "mmusculus_gene_ensembl")
+# retrieving ensembl gene IDs and MGI symbols from biomart
+tx2gene <- as.data.table(getBM(attributes = c('ensembl_transcript_id', 'ensembl_gene_id', 'mgi_symbol'), filters = 'ensembl_transcript_id', values = prom_resistance_anno[, transcript_id], mart = ensembl))
+prom_resistance_anno <- merge(prom_resistance_anno, tx2gene, by.x = "transcript_id", by.y = "ensembl_transcript_id")
+
+tx2gene <- as.data.table(getBM(attributes = c('ensembl_transcript_id', 'ensembl_gene_id', 'mgi_symbol'), filters = 'ensembl_transcript_id', values = unique(dmAndMeth_HCG_prom_pooled_dt[, transcript_id]), mart = ensembl))
+HCG_proms_meth_info <- merge(dmAndMeth_HCG_prom_pooled_dt[group_or_time_point == 1 & condition == "WT", .(seqnames, start, end, meth_perc, perCpg, transcript_id)], tx2gene, by.x = "transcript_id", by.y = "ensembl_transcript_id")
+
+```
+
+```{r saving file for correlation with expression, setup}
+
+to_save <- merge(prom_resistance_dt, as.data.table(promoters)[, .(seqnames, start, end, transcript_id)], by = c("seqnames", "start", "end"))
+to_save <- merge(to_save, tx2gene, by.x = "transcript_id", by.y = "ensembl_transcript_id")
+to_save$meth.diff_1 <- to_save$WT_1 - to_save$KO_1
+to_save$meth.diff_2 <- to_save$WT_2 - to_save$KO_2  
+to_save$meth.diff_3 <- to_save$WT_3 - to_save$KO_3
+
+# averaging meth.diff by gene i.e. averaging the meth.diff of the different transcript isoforms
+to_save <- to_save[, lapply(.SD, mean), by = .(ensembl_gene_id, cluster), .SDcols = grep("WT|KO|meth.diff", names(to_save), value = TRUE)]
+
+# in case different isoforms of a gene belong to different clusters, saving the row of the isoform that is in the most interesting clusters. Clusters' level of interest is, in decreasing order, highlyResistant-D0loosing-lessResistant-none
+ambigous_genes <- to_save[duplicated(to_save$ensembl_gene_id), ensembl_gene_id]
+## removing rows belonging to ambigous genes from the dt
+to_save_f <- to_save[!(ensembl_gene_id %in% ambigous_genes)]
+## function to retrieve back the ambigous rows with the most interesting cluster
+retrieve_ambigous <- function (g) {
+  if (sum(grepl("highly_resistant", to_save[ensembl_gene_id == g, cluster]) == 1)) {
+    return(to_save[ensembl_gene_id == g & cluster == "highly_resistant"])
+  } else if (sum(grepl("D0_loosing", to_save[ensembl_gene_id == g, cluster]) == 1)) {
+    return(to_save[ensembl_gene_id == g & cluster == "D0_loosing"])
+  } else if (sum(grepl("less_resistant", to_save[ensembl_gene_id == g, cluster]) == 1)) {
+    return(to_save[ensembl_gene_id == g & cluster == "less_resistant"])
+  }
+}
+retrieved_dt <- Reduce(function(...) merge(..., all = TRUE, by = names(to_save)), lapply(ambigous_genes, retrieve_ambigous))
+prom_meth_dt <- merge(to_save_f, retrieved_dt, by = names(to_save_f), all = TRUE)
+
+save(prom_meth_dt, file = "prom_meth_dt.Rdata")
+rm(to_save, to_save_f, prom_meth_dt, retrieved_dt)
+
+```
+
+```{r exporting promoters w cluster anno to bed file, setup}
+
+write.table(prom_resistance_anno[cluster != "none", .(seqnames, start, end, name = paste0(transcript_id, "_", ensembl_gene_id, "_", mgi_symbol, "_", cluster), perCpg, strand)], file = paste0("../../analysis/meth_dynamics/clustered_HCG_and_highlyWTmeth_prom.bed"), col.names = FALSE, row.names = FALSE, quote = FALSE, sep = "\t")
+
+```
+
+## Gene Ontology over-representation test for resistant and non-resistant promoters
+
+I use package 'clusterProfiler' to perform both Gene Ontology (GO) Over-representation Test and GO Gene Set Enrichment Test on the list of genes associated with promoters belonging to the resistant cluster and promoters belonging to the D0 loosing and less resistant clusters.
+
+<n>
+
+**IMPORTANT**: since the number of genes is very small, it is more an annotation than a biologically meaningful enrichment.
+
+```{r GO Test, setup}
+
+library(clusterProfiler)
+library(org.Mm.eg.db)
+
+### Function which: 1) perform the GO Over-representation Test for Biological Process, 2) filter for a level of GO terms, 3) simplify the result by grouping those terms which have correlation > 0.7 (keeping only the one with the minimum q-value among the GO terms of one group) 
+perform_BP_go_ora <- function (my_GOIs, f_level) {
+  BP <- enrichGO(gene = my_GOIs,
+                 universe = keys(org.Mm.eg.db, keytype="ENSEMBL"),
+                 OrgDb = org.Mm.eg.db, 
+                 keyType = "ENSEMBL",
+                 ont = "BP",
+                 pAdjustMethod = "BH",
+                 pvalueCutoff = 0.05,
+                 qvalueCutoff = 0.2,
+                 readable = TRUE)
+  BP_f <- gofilter(BP, level = , f_level)
+  return(BP_f)
+  #return(simplify(BP_f, cutoff=0.7, by="qvalue", select_fun=min))
+}
+
+# keeping only gene identifiers and making them unique i.e. ignoring presence of multiple isoforms for one gene
+highly_resistant_GO <- perform_BP_go_ora(prom_resistance_anno[cluster == "highly_resistant", unique(ensembl_gene_id)], f_level = 4)
+less_resistant_GO <- perform_BP_go_ora(prom_resistance_anno[cluster == "less_resistant", unique(ensembl_gene_id)], f_level = 4)
+DO_loosing_GO <- perform_BP_go_ora(prom_resistance_anno[cluster == "D0_loosing", unique(ensembl_gene_id)], f_level = 4)
+
+```
+
+```{r table of GO, results='asis'}
+
+knitr::kable(as.data.frame(highly_resistant_GO), caption = "highly resistant")
+knitr::kable(as.data.frame(less_resistant_GO), caption = "less resistant")
+knitr::kable(as.data.frame(DO_loosing_GO), caption = "G0 loosing")
+
+```
+
+```{r GO Enrichment Test plots, setup, include = TRUE, fig.height=8, fig.width=10, eval = FALSE}
+
+barplot(highly_resistant_GO, showCategory = 10, color = "qvalue", title = "Highly resistant promoters", font.size = 16) +
+  ylim(0.0,3.0) +
+  theme(title = element_text(size = 18),
+        legend.text = element_text(size = 16), legend.title = element_text(size = 18))
+barplot(less_resistant_GO, showCategory = 10, color = "qvalue", title = "Less resistant promoters", font.size = 16) +
+  ylim(0.0,3.0) +
+  theme(title = element_text(size = 18),
+        legend.text = element_text(size = 16), legend.title = element_text(size = 18))
+barplot(DO_loosing_GO, showCategory = 10, color = "qvalue", title = "D0 loosing promoters", font.size = 16) +
+  ylim(0.0,3.0) +
+  theme(title = element_text(size = 18),
+        legend.text = element_text(size = 16), legend.title = element_text(size = 18))
+
+```
+
+```{r GO Enrichment Test plot FOR PAPER FIGURE, setup, include = TRUE, fig.height=8, fig.width=10, eval = FALSE}
+
+all_GO_df <- rbind(fortify(highly_resistant_GO, showCategory = 10), fortify(less_resistant_GO, showCategory = 10), fortify(DO_loosing_GO, showCategory = 10))
+all_GO_df$Description <- factor(all_GO_df$Description, levels=rev(c(as.character(fortify(highly_resistant_GO, showCategory = 10)$Description), as.character(fortify(less_resistant_GO, showCategory = 10)$Description), as.character(fortify(DO_loosing_GO, showCategory = 10)$Description))))
+
+library(DOSE)
+
+ggplot(all_GO_df, aes_string(x = "Count", y = "Description", fill = "qvalue")) +
+      scale_fill_continuous(low="red", high="blue", name = "qvalue", guide = guide_colorbar(reverse=TRUE)) +
+      geom_col() +
+      xlab("Gene count") + ylab(NULL) +
+      theme_dose(13) +
+      theme(title = element_text(size = 18),
+            legend.text = element_text(size = 14), legend.title = element_text(size = 14))
+
+```
+
+```{r sessioninfo, setup, echo = TRUE, results = 'markup'}
+
+sessionInfo()
+
+```

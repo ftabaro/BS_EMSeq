@@ -1,0 +1,15 @@
+channels:
+  - conda-forge 
+  - bioconda
+  - defaults
+  - r
+dependencies:
+  - trim-galore=0.6.4
+  - snakemake=5.5.4
+  - fastqc=0.11.8
+  - bismark=0.22.3
+  - pigz=2.3.4
+  - perl-gd=2.71
+  - perl-gdgraph=1.54
+  - bedtools=2.29.2
+  - samtools=1.10
