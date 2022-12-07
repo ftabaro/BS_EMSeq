@@ -6,3 +6,5 @@ Rmd/*.RData
 #ignore Rmd cache and files
 Rmd/*_files/
 Rmd/*_cache/
+# ignore Rmd produced html
+Rmd/*.html
