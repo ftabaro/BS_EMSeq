@@ -212,7 +212,7 @@ meth_violin_by_repClass(meth_TE_pooled_dt[grep("L1$|L2$|ERV1$|ERVK$|ERVL$|B2$|B4
 
 ```
 
-# Closer look at RNA transposons
+# Loss of methylation at RNA transposons
 
 ```{r computing loss of methylation, setup}
 
@@ -235,7 +235,7 @@ meth_TE_pooled_byrepName <- make_wide(meth_TE_pooled_dt)
 
 ```
 
-```{r heatmap, setup, include = TRUE, fig.height=5, fig.width=8}
+```{r heatmap, setup, include = TRUE, fig.height=3, fig.width=5}
 
 ## Function to make a heatmap with a subset of repeat elements
 TE_hm <- function (wide_table, my_favourite_class, my_favourite_repeats) {
@@ -248,7 +248,7 @@ TE_hm <- function (wide_table, my_favourite_class, my_favourite_repeats) {
   # rownames appearing on heatmap will be the repNames
   rownames(pheat_df) <- wide_table$repName
   # plotting heatmap
-  pheatmap(pheat_df, cluster_rows = FALSE, cluster_cols = FALSE, show_rownames = TRUE, clustering_distance_rows = distfun(pheat_df), fontsize = 20, main = my_favourite_class)
+  pheatmap(pheat_df, cluster_rows = FALSE, cluster_cols = FALSE, show_rownames = TRUE, clustering_distance_rows = distfun(pheat_df), fontsize = 14, main = my_favourite_class)
 }
 
 TE_hm(meth_TE_pooled_byrepName, my_favourite_class = "LINE/SINE", my_favourite_repeats = c("L1MdA", "L1MdF", "L1MdT", "Lx2B2", "Lx3C", "B1_Mm", "B2_Mm1a"))
